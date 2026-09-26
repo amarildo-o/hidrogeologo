@@ -8,6 +8,7 @@ import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
@@ -15,6 +16,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.PictureAsPdf
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -30,6 +32,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -44,6 +47,11 @@ import com.hidrogeologo.campo.HidroCampoApp
 import com.hidrogeologo.campo.data.model.WellRecord
 import com.hidrogeologo.campo.ui.components.SectionCard
 import com.hidrogeologo.campo.util.DateUtils
+import com.hidrogeologo.campo.util.PdfReportGenerator
+import com.hidrogeologo.campo.util.ShareUtils
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -62,6 +70,10 @@ fun RecordDetailScreen(
     val photos by viewModel.photos.collectAsState()
     var showDeleteConfirm by remember { mutableStateOf(false) }
 
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var isExportingPdf by remember { mutableStateOf(false) }
+
     Scaffold(
         topBar = {
             TopAppBar(
@@ -72,6 +84,26 @@ fun RecordDetailScreen(
                     }
                 },
                 actions = {
+                    if (isExportingPdf) {
+                        CircularProgressIndicator(modifier = Modifier.padding(12.dp).size(20.dp))
+                    } else {
+                        IconButton(
+                            enabled = record != null,
+                            onClick = {
+                                val currentRecord = record ?: return@IconButton
+                                scope.launch {
+                                    isExportingPdf = true
+                                    val file = withContext(Dispatchers.IO) {
+                                        PdfReportGenerator.generate(context, currentRecord, photos)
+                                    }
+                                    isExportingPdf = false
+                                    ShareUtils.shareFile(context, file, "application/pdf")
+                                }
+                            }
+                        ) {
+                            Icon(Icons.Filled.PictureAsPdf, contentDescription = "Exportar a PDF")
+                        }
+                    }
                     IconButton(onClick = { onEdit(recordId) }) {
                         Icon(Icons.Filled.Edit, contentDescription = "Editar")
                     }
