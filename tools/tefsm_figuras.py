@@ -36,6 +36,7 @@ FORMATO DE ENTRADA (formato "largo": una fila por lectura)
 """
 import argparse
 import os
+import re
 import sys
 
 import numpy as np
@@ -78,6 +79,39 @@ def leer(path, requeridas, opcionales=()):
                          f"Columnas encontradas: {list(df.columns)}")
     res = pd.DataFrame(out).dropna(subset=list(requeridas))
     return res
+
+
+def leer_equipo(path, args):
+    """Formato del equipo: L, N, freq01..freqNN (mV). Devuelve formato largo y_m, f_hz, dv_mv."""
+    ext = os.path.splitext(path)[1].lower()
+    df = pd.read_excel(path) if ext in (".xlsx", ".xls") else pd.read_csv(path, sep=None, engine="python")
+    df.columns = [str(c).strip().lower() for c in df.columns]
+    cols = sorted(c for c in df.columns if c.startswith("freq") and c[4:].isdigit())
+    if args.linea is not None:
+        df = df[df["l"] == args.linea]
+    nf = len(cols)
+    if args.freqs:
+        if os.path.isfile(args.freqs):
+            fr = np.loadtxt(args.freqs, delimiter=",").ravel()
+        else:
+            fr = np.array([float(x) for x in args.freqs.split(",")])
+        if len(fr) != nf:
+            sys.exit(f"Se dieron {len(fr)} frecuencias pero el archivo tiene {nf} columnas freqNN")
+    else:
+        fr = np.logspace(np.log10(args.fmin), np.log10(args.fmax), nf)
+        print(f"AVISO: no se dieron frecuencias; se asumen {nf} valores log-espaciados "
+              f"entre {args.fmin:g} y {args.fmax:g} Hz (freq01 = la menor). Use --freqs.")
+    y = (df["n"].astype(float) - df["n"].astype(float).min()) * args.dx + args.y0
+    if args.y_es_n:
+        y = df["n"].astype(float)
+    filas = []
+    for c, f in zip(cols, fr):
+        filas.append(pd.DataFrame({"y_m": y.values, "f_hz": f,
+                                   "dv_mv": pd.to_numeric(df[c], errors="coerce").values}))
+    out = pd.concat(filas, ignore_index=True)
+    out = out[out["dv_mv"] > args.umbral].dropna()
+    out.attrs["fmin_equipo"] = float(np.min(fr))
+    return out
 
 
 def a_malla(df, valor):
@@ -166,7 +200,12 @@ def figura_modulo(args):
 #   h_s = c * 503 * sqrt(rho / f)     (ec. 12)
 # ----------------------------------------------------------------------------
 def figura_pseudo(args):
-    df = leer(args.archivo, ["y_m", "f_hz", "dv_mv"], ["rho_ohm_m"])
+    cab = pd.read_csv(args.archivo, nrows=0, sep=None, engine="python") \
+        if not args.archivo.lower().endswith((".xlsx", ".xls")) else pd.read_excel(args.archivo, nrows=0)
+    if any(str(c).strip().lower().startswith("freq") for c in cab.columns):
+        df = leer_equipo(args.archivo, args)
+    else:
+        df = leer(args.archivo, ["y_m", "f_hz", "dv_mv"], ["rho_ohm_m"])
     if "rho_ohm_m" not in df.columns:
         df["rho_ohm_m"] = args.rho
     df["rho_ohm_m"] = df["rho_ohm_m"].fillna(args.rho)
@@ -174,11 +213,25 @@ def figura_pseudo(args):
 
     dvmin = df["dv_mv"].min()  # minimo de todo el perfil
     df["K"] = np.log10(df["dv_mv"] / dvmin)
-    df["hs"] = args.c * 503.0 * np.sqrt(df["rho_ohm_m"] / df["f_hz"])
+    # Rango de profundidad del equipo (100/150/300 m): --prof, o se toma del nombre ("150M_L93.csv")
+    prof_eq = args.prof
+    if prof_eq is None:
+        m = re.search(r"(\d+)\s*m", os.path.basename(args.archivo), re.I)
+        prof_eq = float(m.group(1)) if m and float(m.group(1)) in (100, 150, 300) else None
+    c = args.c
+    if c is None:
+        if prof_eq is not None:
+            # c tal que la frecuencia mas baja del equipo llegue a la profundidad configurada
+            fmin = df.attrs.get("fmin_equipo", df["f_hz"].min())
+            c = prof_eq / (503.0 * np.sqrt(args.rho / fmin))
+            print(f"Rango del equipo {prof_eq:g} m -> c = {c:.4f} (calibrado con f_min = {fmin:g} Hz, rho = {args.rho:g})")
+        else:
+            c = 1.0
+    df["hs"] = c * 503.0 * np.sqrt(df["rho_ohm_m"] / df["f_hz"])
 
     # interpolar K(hs) en cada posicion y sobre una malla de profundidad comun
     ys = np.sort(df["y_m"].unique())
-    hmax = args.hmax if args.hmax else float(df["hs"].max())
+    hmax = args.hmax or prof_eq or float(df["hs"].max())
     hmin = float(df["hs"].min())
     prof = np.linspace(hmin, hmax, 200)
     K = np.full((len(prof), len(ys)), np.nan)
@@ -273,9 +326,24 @@ def main():
     b.add_argument("archivo")
     b.add_argument("--rho", type=float, default=220.0,
                    help="resistividad aparente (ohm.m) si no hay columna rho (def. 220, zona fracturada)")
-    b.add_argument("--c", type=float, default=1.0, help="coeficiente empirico c de la ec. 12")
-    b.add_argument("--hmax", type=float, default=300.0, help="profundidad maxima mostrada (m)")
+    b.add_argument("--c", type=float, default=None,
+                   help="coeficiente empirico c de la ec. 12 (si falta: se calibra con --prof, o 1)")
+    b.add_argument("--prof", type=float, default=None, choices=[100, 150, 300],
+                   help="rango de profundidad configurado en el equipo (m); por defecto se lee del nombre del archivo")
+    b.add_argument("--hmax", type=float, default=None, help="profundidad maxima mostrada (m)")
     b.add_argument("--zk", type=float, default=None, help="posicion (m) del sondeo ZK a marcar")
+    b.add_argument("--freqs", default=None,
+                   help="(formato equipo) frecuencias en Hz separadas por coma, o archivo con ellas; "
+                        "una por columna freqNN, en el mismo orden")
+    b.add_argument("--fmin", type=float, default=12.0, help="(formato equipo) fmin si no hay --freqs")
+    b.add_argument("--fmax", type=float, default=5000.0, help="(formato equipo) fmax si no hay --freqs")
+    b.add_argument("--dx", type=float, default=1.0, help="(formato equipo) metros entre puntos N consecutivos")
+    b.add_argument("--y0", type=float, default=0.0, help="(formato equipo) posicion y (m) del menor N")
+    b.add_argument("--y-es-n", action="store_true", help="(formato equipo) usar N directamente como y (m)")
+    b.add_argument("--linea", type=int, default=None, help="(formato equipo) filtrar por el registro L del equipo (p. ej. 93)")
+    b.add_argument("--umbral", type=float, default=0.1,
+                   help="descarta lecturas <= umbral (mV) como ruido/canal muerto (def. 0.1); "
+                        "evita que dV_min sea ~0 en la ec. 13")
     comun(b)
     b.set_defaults(fn=figura_pseudo)
 
